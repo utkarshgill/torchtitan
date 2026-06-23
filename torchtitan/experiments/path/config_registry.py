@@ -61,11 +61,11 @@ _LINEAR_INIT = {"weight": partial(nn.init.normal_, mean=0.0, std=0.02), "bias": 
 _NORM_INIT = {"weight": nn.init.ones_, "bias": nn.init.zeros_}
 
 
-def model_registry(flavor: str) -> ModelSpec:
+def model_registry(flavor: str, *, mup: bool = False, width: int = 256) -> ModelSpec:
     return ModelSpec(
         name="path",
         flavor=flavor,
-        model=_model_config(flavor),
+        model=_model_config(flavor, mup=mup, width=width),
         parallelize_fn=parallelize_path,
         pipelining_fn=None,
         post_optimizer_build_fn=None,
@@ -93,7 +93,46 @@ def fastvit_t12() -> PathTrainer.Config:
     return _path("fastvit_t12")
 
 
-def _path(flavor: str) -> PathTrainer.Config:
+# convnext muP width sweep: the muTransfer axis is lr (set per run); base shape is convnext_base,
+# scaled by width W (base 256). standard variants are the same shapes without the muP init/lr/readout.
+# muTransfer sweep axis: one run per (param, width, lr); base lr set with `-e CONVNEXT_LR=...`.
+# Only the sweep configs below read it; the production convnext/fastvit flavors stay at lr=1e-3.
+CONVNEXT_SWEEP_LR = float(os.getenv("CONVNEXT_LR", "1e-3"))
+
+
+def convnext_standard_w256() -> PathTrainer.Config:
+    return _path("convnext_base", mup=False, width=256, lr=CONVNEXT_SWEEP_LR)
+
+
+def convnext_standard_w512() -> PathTrainer.Config:
+    return _path("convnext_base", mup=False, width=512, lr=CONVNEXT_SWEEP_LR)
+
+
+def convnext_standard_w1024() -> PathTrainer.Config:
+    return _path("convnext_base", mup=False, width=1024, lr=CONVNEXT_SWEEP_LR)
+
+
+def convnext_standard_w2048() -> PathTrainer.Config:
+    return _path("convnext_base", mup=False, width=2048, lr=CONVNEXT_SWEEP_LR)
+
+
+def convnext_mup_w256() -> PathTrainer.Config:
+    return _path("convnext_base", mup=True, width=256, lr=CONVNEXT_SWEEP_LR)
+
+
+def convnext_mup_w512() -> PathTrainer.Config:
+    return _path("convnext_base", mup=True, width=512, lr=CONVNEXT_SWEEP_LR)
+
+
+def convnext_mup_w1024() -> PathTrainer.Config:
+    return _path("convnext_base", mup=True, width=1024, lr=CONVNEXT_SWEEP_LR)
+
+
+def convnext_mup_w2048() -> PathTrainer.Config:
+    return _path("convnext_base", mup=True, width=2048, lr=CONVNEXT_SWEEP_LR)
+
+
+def _path(flavor: str, *, mup: bool = False, width: int = 256, lr: float = 1e-3) -> PathTrainer.Config:
     steps = 1024*100
     validation_freq = 1024
     reports = {
@@ -119,10 +158,10 @@ def _path(flavor: str) -> PathTrainer.Config:
     plan_only = False
     return PathTrainer.Config(
         loss=PathLoss.Config(),
-        model_spec=model_registry(flavor),
+        model_spec=model_registry(flavor, mup=mup, width=width),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=_dataloader_config(split="train", fps=fps, plan_only=plan_only),
-        optimizer=_optimizer_config(),
+        optimizer=_optimizer_config(mup=mup, width=width, lr=lr),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=round(steps * 0.01),
             total_steps=steps,
@@ -170,7 +209,7 @@ def _path(flavor: str) -> PathTrainer.Config:
     )
 
 
-def _model_config(flavor: str) -> PathModel.Config:
+def _model_config(flavor: str, *, mup: bool = False, width: int = 256) -> PathModel.Config:
     vision_features = 512
     n_frames_input = N_FRAMES
     input_frame_names = INPUT_FRAMES_NAMES
@@ -194,6 +233,9 @@ def _model_config(flavor: str) -> PathModel.Config:
             drop_path_rate=0.2,
             mean=255 / 2,
             std=255 / 4,
+            width=width,
+            mup=mup,
+            output_mult=(256 / width) if mup else 1.0,  # muP readout multiplier 1/m
         ),
         point_policy=Policy.Config(
             summarizer=PointSummarizer.Config(
@@ -293,24 +335,44 @@ def _si_int(value: str | int) -> int:
     return int(float(value[:-1]) * suffixes[value[-1]]) if value[-1] in suffixes else int(value)
 
 
-def _optimizer_config() -> OptimizersContainer.Config:
-    common = {"lr": 1e-3, "betas": (0.9, 0.95), "eps": 1e-8}
+# convnext muP: width-scaling matmuls in the vision backbone get lr eta/m. Excludes depthwise conv_dw
+# (fan_in = kernel^2, width-independent), the input stem, norms, biases, and all downstream policy heads.
+CONVNEXT_MUP_PATTERN = (
+    r"^vision\.encoder\.("
+    r"stages\.\d+\.blocks\.\d+\.(mlp\.fc1|mlp\.fc2|shortcut\.conv)"
+    r"|stages\.\d+\.downsample\.1"
+    r"|head\.(pre_logits\.fc|fc)"
+    r")\.weight$"
+)
+
+
+def _optimizer_config(*, mup: bool = False, width: int = 256, lr: float = 1e-3) -> OptimizersContainer.Config:
+    common = {"lr": lr, "betas": (0.9, 0.95), "eps": 1e-8}
     no_decay = r"(point_policy\.hydra|temporal_policy\.temporal_hydra)\.(final_layer|scale_layer)"
-    return OptimizersContainer.Config(
-        implementation="fused_opt_states_bf16",
-        param_groups=[
+    # no_decay first, then (muP only) the eta/m backbone group, then the catch-all (first match wins).
+    groups = [
+        ParamGroupConfig(
+            pattern=no_decay,
+            optimizer_name="AdamW",
+            optimizer_kwargs={**common, "weight_decay": 0.0},
+        ),
+    ]
+    if mup:
+        groups.append(
             ParamGroupConfig(
-                pattern=no_decay,
+                pattern=CONVNEXT_MUP_PATTERN,
                 optimizer_name="AdamW",
-                optimizer_kwargs={**common, "weight_decay": 0.0},
-            ),
-            ParamGroupConfig(
-                pattern=r".*",
-                optimizer_name="AdamW",
-                optimizer_kwargs={**common, "weight_decay": 3e-2},
-            ),
-        ],
+                optimizer_kwargs={**common, "lr": lr / (width / 256), "weight_decay": 3e-2},
+            )
+        )
+    groups.append(
+        ParamGroupConfig(
+            pattern=r".*",
+            optimizer_name="AdamW",
+            optimizer_kwargs={**common, "weight_decay": 3e-2},
+        )
     )
+    return OptimizersContainer.Config(implementation="fused_opt_states_bf16", param_groups=groups)
 
 
 def _heads(heads) -> tuple[PathHead, ...]:

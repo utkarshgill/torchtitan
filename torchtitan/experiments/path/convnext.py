@@ -21,6 +21,8 @@ from timm.layers import (
 )
 from timm.models._manipulate import checkpoint_seq, named_apply
 
+from .path_mup_helpers import hidden_std
+
 
 __all__ = [
     "CONVNEXT_FLAVORS",
@@ -219,6 +221,7 @@ class ConvNeXt(nn.Module):
         drop_path_rate: float = 0.0,
         device=None,
         dtype=None,
+        mup: bool = False,
     ) -> None:
         super().__init__()
         assert output_stride in (8, 16, 32)
@@ -228,6 +231,7 @@ class ConvNeXt(nn.Module):
         self.in_chans = in_chans
         self.drop_rate = drop_rate
         self.head_init_scale = head_init_scale
+        self.mup = mup
         self.feature_info = []
 
         self.stem = nn.Sequential(
@@ -277,7 +281,7 @@ class ConvNeXt(nn.Module):
             act_layer="gelu",
             **dd,
         )
-        named_apply(partial(_init_weights, head_init_scale=head_init_scale), self)
+        named_apply(partial(_init_weights, head_init_scale=head_init_scale, mup=mup), self)
 
     def set_grad_checkpointing(self, enable: bool = True) -> None:
         for stage in self.stages:
@@ -316,7 +320,7 @@ class ConvNeXt(nn.Module):
         self.head.reset(num_classes, global_pool)
 
     def init_path_weights(self) -> None:
-        named_apply(partial(_init_weights, head_init_scale=self.head_init_scale), self)
+        named_apply(partial(_init_weights, head_init_scale=self.head_init_scale, mup=self.mup), self)
         for module in self.modules():
             if isinstance(module, ConvNeXtBlock):
                 module.reset_parameters()
@@ -333,13 +337,18 @@ class ConvNeXt(nn.Module):
         return self.forward_head(self.forward_features(x))
 
 
-def _init_weights(module: nn.Module, name: str | None = None, head_init_scale: float = 1.0) -> None:
+def _init_weights(
+    module: nn.Module, name: str | None = None, head_init_scale: float = 1.0, *, mup: bool = False
+) -> None:
     if isinstance(module, nn.Conv2d):
-        trunc_normal_(module.weight, std=0.02)
+        # muP: 1/sqrt(fan_in). Depthwise convs (groups==in_channels) reduce to fan_in=k*k, so they stay
+        # width-independent like the stem -- only pointwise/width-scaling convs change with width.
+        fan_in = module.in_channels // module.groups * module.kernel_size[0] * module.kernel_size[1]
+        trunc_normal_(module.weight, std=hidden_std(fan_in) if mup else 0.02)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Linear):
-        trunc_normal_(module.weight, std=0.02)
+        trunc_normal_(module.weight, std=hidden_std(module.in_features) if mup else 0.02)
         nn.init.zeros_(module.bias)
         if name and "head." in name:
             module.weight.data.mul_(head_init_scale)

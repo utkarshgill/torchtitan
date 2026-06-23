@@ -31,6 +31,7 @@ from torchtitan.tools.logging import logger
 from xx.ml_tools.constants.model import ModelInputs
 
 from . import convnext, fastvit
+from .path_mup_helpers import scale_dims
 
 
 @dataclass(frozen=True)
@@ -311,6 +312,9 @@ class Vision(Module):
         drop_path_rate: float
         mean: float
         std: float
+        width: int = 256  # muP width knob; scales the backbone, vision_features stays fixed
+        mup: bool = False
+        output_mult: float = 1.0  # muP readout multiplier 1/m (1.0 for standard param)
 
     def __init__(self, config: Config):
         super().__init__()
@@ -319,10 +323,11 @@ class Vision(Module):
             flavor = convnext.CONVNEXT_FLAVORS[config.flavor]
             self.encoder = convnext.ConvNeXt(
                 depths=flavor["depths"],
-                dims=flavor["dims"],
+                dims=scale_dims(flavor["dims"], config.width),
                 in_chans=config.in_channels,
                 num_classes=config.vision_features,
                 drop_path_rate=config.drop_path_rate,
+                mup=config.mup,
             )
             self._pretrained_name = flavor["pretrained"]
             self._first_conv_names = ("stem.0.weight",)
@@ -392,7 +397,8 @@ class Vision(Module):
         x = torch.cat([inputs[name] for name in self.config.input_frame_names], dim=1)
         dtype = next(self.encoder.parameters()).dtype
         x = x.to(dtype)
-        return self.encoder((x - self._mean.to(dtype)) / self._std.to(dtype))
+        out = self.encoder((x - self._mean.to(dtype)) / self._std.to(dtype))
+        return out * self.config.output_mult  # muP 1/m readout scaling (no-op when standard)
 
 
 class PathModel(BaseModel):
